@@ -1,4 +1,4 @@
-#!/Users/victoria/Documents/GitHub/ai-voice-notes/backend/venv/bin/python3.12
+#!/Users/victoria/Documents/GitHub/hello/backend/venv/bin/python3.12
 # -*- coding: utf-8 -*-
 import re
 import sys
