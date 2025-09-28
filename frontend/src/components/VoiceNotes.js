@@ -1,4 +1,4 @@
-// VoiceNotes.js - Fixed Real-time Updates
+// VoiceNotes.js - Fixed Real-time Updates with Volume Meter and Removed Filler Words
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import {
   Mic,
@@ -33,16 +33,17 @@ const WidgetApp = () => {
   });
   const [dragging, setDragging] = useState(false);
 
-  // Speech coaching states
+  // Speech coaching states - REMOVED filler_words
   const [sessionId, setSessionId] = useState(null);
+  const sessionIdRef = useRef(null); // Add a ref to persist session ID
   const [liveStats, setLiveStats] = useState({
     fluency: 0,
     volume: 0,
     articulation: 0,
     clarity: 0,
-    filler_words: 0,
     speaking_rate: 0,
     confidence: 0
+    // Removed filler_words
   });
   const [speechAnalysis, setSpeechAnalysis] = useState(null);
   const [isProcessingAudio, setIsProcessingAudio] = useState(false);
@@ -54,6 +55,41 @@ const WidgetApp = () => {
   const audioChunks = useRef([]);
   const statsIntervalRef = useRef(null);
   const lastProcessedText = useRef("");
+
+  /** --- Real-time Volume Analysis --- **/
+  const analyzeAudioVolume = useCallback((stream) => {
+    if (!audioContextRef.current) return;
+    
+    const analyser = audioContextRef.current.createAnalyser();
+    const source = audioContextRef.current.createMediaStreamSource(stream);
+    source.connect(analyser);
+    
+    analyser.fftSize = 256;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    const updateVolume = () => {
+      if (!isRecording) return;
+      
+      analyser.getByteFrequencyData(dataArray);
+      
+      // Calculate RMS volume
+      let sum = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        sum += dataArray[i] * dataArray[i];
+      }
+      const rms = Math.sqrt(sum / bufferLength);
+      const volume = Math.min(100, (rms / 128) * 100); // Normalize to 0-100
+      
+      setLiveStats(prev => ({ ...prev, volume: Math.round(volume) }));
+      
+      if (isRecording) {
+        requestAnimationFrame(updateVolume);
+      }
+    };
+    
+    updateVolume();
+  }, [isRecording]);
 
   /** --- Dragging Logic --- **/
   const handleMouseDown = (e) => {
@@ -118,7 +154,13 @@ const WidgetApp = () => {
           if (data.success && data.live_stats) {
             setLiveStats(prev => {
               console.log('Updating live stats:', data.live_stats);
-              return { ...prev, ...data.live_stats };
+              // Don't override volume from real-time analysis, only update other stats
+              const { volume: currentVolume, ...otherStats } = prev;
+              return { 
+                ...prev, 
+                ...data.live_stats,
+                volume: currentVolume // Keep real-time volume
+              };
             });
           }
         } else {
@@ -152,6 +194,7 @@ const WidgetApp = () => {
       const data = await response.json();
       if (data.success) {
         setSessionId(data.session_id);
+        sessionIdRef.current = data.session_id; // Store in ref for persistence
         console.log('Voice session created:', data.session_id);
         return data.session_id;
       } else {
@@ -176,6 +219,9 @@ const WidgetApp = () => {
       });
       
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      
+      // Start real-time volume analysis
+      analyzeAudioVolume(stream);
       
       const options = { mimeType: 'audio/webm' };
       if (!MediaRecorder.isTypeSupported(options.mimeType)) {
@@ -230,7 +276,15 @@ const WidgetApp = () => {
       
       const data = await response.json();
       if (data.success && data.live_stats) {
-        setLiveStats(prev => ({ ...prev, ...data.live_stats }));
+        setLiveStats(prev => {
+          // Don't override volume from real-time analysis
+          const { volume: currentVolume, ...otherStats } = prev;
+          return { 
+            ...prev, 
+            ...data.live_stats,
+            volume: currentVolume // Keep real-time volume
+          };
+        });
       }
     } catch (error) {
       console.error('Audio processing error:', error);
@@ -239,36 +293,75 @@ const WidgetApp = () => {
 
   /** --- Process Text Updates --- **/
   const processTextUpdate = async (newText) => {
-    if (!sessionId || !isRecording || !newText.trim()) return;
+    // Use ref for session ID to avoid timing issues with state
+    const currentSessionId = sessionIdRef.current || sessionId;
+    
+    if (!currentSessionId || !newText.trim()) {
+      console.log('Skipping text processing:', { 
+        sessionId: currentSessionId, 
+        stateSessionId: sessionId,
+        hasText: !!newText.trim() 
+      });
+      return;
+    }
     
     // Avoid sending duplicate text
-    if (newText === lastProcessedText.current) return;
+    if (newText === lastProcessedText.current) {
+      console.log('Skipping duplicate text:', newText);
+      return;
+    }
     lastProcessedText.current = newText;
     
     console.log('Processing text update:', newText);
+    console.log('Sending to URL:', `${API_BASE_URL}/voice/session/${currentSessionId}/audio`);
     
     try {
-      const response = await fetch(`${API_BASE_URL}/voice/session/${sessionId}/audio`, {
+      const requestBody = {
+        audio_data: '',
+        text_chunk: newText.trim()
+      };
+      console.log('Request body:', requestBody);
+      
+      const response = await fetch(`${API_BASE_URL}/voice/session/${currentSessionId}/audio`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audio_data: '',
-          text_chunk: newText.trim()
-        })
+        headers: { 
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(requestBody)
       });
+      
+      console.log('Response status:', response.status);
+      console.log('Response headers:', response.headers);
       
       if (response.ok) {
         const data = await response.json();
         console.log('Text processing response:', data);
         if (data.success && data.live_stats) {
           console.log('Updating stats from text processing:', data.live_stats);
-          setLiveStats(prev => ({ ...prev, ...data.live_stats }));
+          setLiveStats(prev => {
+            // Don't override volume from real-time analysis
+            const { volume: currentVolume, ...otherStats } = prev;
+            return { 
+              ...prev, 
+              ...data.live_stats,
+              volume: currentVolume // Keep real-time volume
+            };
+          });
+        } else {
+          console.log('No stats in response or success=false');
         }
       } else {
-        console.error('Text processing failed:', response.status);
+        const errorText = await response.text();
+        console.error('Text processing failed:', response.status, errorText);
       }
     } catch (error) {
       console.error('Text processing error:', error);
+      console.error('Error details:', {
+        name: error.name,
+        message: error.message,
+        stack: error.stack
+      });
     }
   };
 
@@ -287,12 +380,15 @@ const WidgetApp = () => {
     };
 
     recognition.onresult = (event) => {
+      console.log('Speech recognition result event:', event);
       let interim = "";
       let final = "";
       let newFinalText = "";
       
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const transcript = event.results[i][0].transcript;
+        console.log(`Result ${i}: "${transcript}" (final: ${event.results[i].isFinal})`);
+        
         if (event.results[i].isFinal) {
           final += transcript + " ";
           newFinalText = transcript;
@@ -301,15 +397,24 @@ const WidgetApp = () => {
         }
       }
       
+      console.log('Final text:', final);
+      console.log('Interim text:', interim);
+      
       if (final) {
         setFinalTranscript(prev => {
           const updated = prev + final;
+          console.log('Updated final transcript:', updated);
           return updated;
         });
-        setTranscript(prev => prev + final + interim);
+        setTranscript(prev => {
+          const updated = prev + final + interim;
+          console.log('Updated full transcript:', updated);
+          return updated;
+        });
         
         // Process new final text for analysis
         if (newFinalText.trim()) {
+          console.log('Processing new final text:', newFinalText.trim());
           processTextUpdate(newFinalText.trim());
         }
       } else {
@@ -489,16 +594,10 @@ const WidgetApp = () => {
   };
 
   /** --- Get Progress Bar Color --- **/
-  const getProgressBarColor = (value, metric) => {
-    if (metric === 'filler_words') {
-      if (value <= 2) return 'high';
-      if (value <= 5) return 'medium';
-      return 'low';
-    } else {
-      if (value >= 80) return 'high';
-      if (value >= 60) return 'medium';
-      return 'low';
-    }
+  const getProgressBarColor = (value) => {
+    if (value >= 80) return 'high';
+    if (value >= 60) return 'medium';
+    return 'low';
   };
 
   /** --- Render Progress Bar --- **/
@@ -512,7 +611,7 @@ const WidgetApp = () => {
       </div>
       <div className="progress-bar">
         <div 
-          className={`progress-fill ${getProgressBarColor(value, metric)}`}
+          className={`progress-fill ${getProgressBarColor(value)}`}
           style={{ width: `${Math.min(100, Math.max(0, metric === 'speaking_rate' ? (value / 200) * 100 : value))}%` }}
         ></div>
       </div>
@@ -536,6 +635,7 @@ const WidgetApp = () => {
         console.error('Error deleting session:', error);
       }
       setSessionId(null);
+      sessionIdRef.current = null; // Clear the ref too
     }
     
     setLiveStats({
@@ -543,9 +643,9 @@ const WidgetApp = () => {
       volume: 0,
       articulation: 0,
       clarity: 0,
-      filler_words: 0,
       speaking_rate: 0,
       confidence: 0
+      // Removed filler_words
     });
 
     lastProcessedText.current = "";
@@ -645,15 +745,16 @@ const WidgetApp = () => {
     setTranscript("");
     setFinalTranscript("");
     setSessionId(null);
+    sessionIdRef.current = null; // Clear the ref
     setSpeechAnalysis(null);
     setLiveStats({
       fluency: 0,
       volume: 0,
       articulation: 0,
       clarity: 0,
-      filler_words: 0,
       speaking_rate: 0,
       confidence: 0
+      // Removed filler_words
     });
     lastProcessedText.current = "";
   };
@@ -689,7 +790,7 @@ const WidgetApp = () => {
       {isExpanded && (
         <div className="ai-meeting-assistant glass-effect">
           <div className="widget-header">
-            <h2>{user ? "🎯 Speech Coach" : "Login / Sign Up"}</h2>
+            <h2>{user ? "FairFrame" : "Login / Sign Up"}</h2>
             <button className="collapse-btn" onClick={() => setIsExpanded(false)}>
               <ChevronDown size={18} />
             </button>
@@ -761,42 +862,6 @@ const WidgetApp = () => {
                 >
                   <FileDown size={18} /> Export
                 </button>
-                {/* Debug button to test backend connection */}
-                <button
-                  onClick={async () => {
-                    try {
-                      const response = await fetch(`${API_BASE_URL}/test`);
-                      const data = await response.json();
-                      console.log('Backend test:', data);
-                      alert(`Backend test: ${data.message}`);
-                    } catch (error) {
-                      console.error('Backend test error:', error);
-                      alert(`Backend test failed: ${error.message}`);
-                    }
-                  }}
-                  style={{ fontSize: '12px', padding: '4px 8px' }}
-                >
-                  Test
-                </button>
-                
-                {/* Force update stats for testing */}
-                <button
-                  onClick={() => {
-                    console.log('Forcing stats update');
-                    setLiveStats({
-                      fluency: 75,
-                      volume: 65,
-                      articulation: 80,
-                      clarity: 70,
-                      filler_words: 8,
-                      speaking_rate: 150,
-                      confidence: 72
-                    });
-                  }}
-                  style={{ fontSize: '12px', padding: '4px 8px' }}
-                >
-                  Force Update
-                </button>
                 <button className="logout-btn" onClick={handleLogout}>
                   Logout
                 </button>
@@ -859,7 +924,7 @@ const WidgetApp = () => {
                           {Math.round((liveStats.fluency + liveStats.clarity + liveStats.confidence) / 3)}/100
                         </div>
                         <div className="metric-trend">
-                          {isRecording ? `Analyzing... (${JSON.stringify(liveStats).substring(0, 50)}...)` : 'Ready'}
+                          {isRecording ? 'Analyzing...' : 'Ready'}
                         </div>
                       </div>
 
@@ -882,28 +947,16 @@ const WidgetApp = () => {
                     <div className="progress-section">
                       <h4 className="section-title">Voice Analysis Metrics</h4>
                       
-                      {/* Debug info - remove this once working */}
-                      <div style={{ fontSize: '10px', color: '#666', marginBottom: '10px' }}>
-                        Debug: {JSON.stringify(liveStats)}
-                      </div>
-                      
                       {renderProgressBar("Fluency", liveStats.fluency || 0, "fluency")}
                       {renderProgressBar("Volume Level", liveStats.volume || 0, "volume")}
                       {renderProgressBar("Articulation", liveStats.articulation || 0, "articulation")}
                       {renderProgressBar("Clarity", liveStats.clarity || 0, "clarity")}
                       {renderProgressBar("Confidence", liveStats.confidence || 0, "confidence")}
-                      {renderProgressBar("Filler Words", liveStats.filler_words || 0, "filler_words")}
                     </div>
 
                     <div className="insights-section">
                       <h4 className="section-title">Live Insights</h4>
                       <div className="insight-cards">
-                        {liveStats.filler_words > 5 && (
-                          <div className="insight-card warning">
-                            <span className="insight-icon">⚠️</span>
-                            <span>High filler word usage detected</span>
-                          </div>
-                        )}
                         {liveStats.volume < 20 && isRecording && (
                           <div className="insight-card warning">
                             <span className="insight-icon">🔉</span>
